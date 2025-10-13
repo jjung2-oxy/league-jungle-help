@@ -1,0 +1,8 @@
+monitor_index: 1
+roi:
+  height: 200
+  left: 2664
+  top: 1404
+  width: 200
+show_scale: 1.0
+target_fps: 20
