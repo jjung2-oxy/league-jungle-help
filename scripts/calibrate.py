@@ -118,7 +118,7 @@ def main():
     try:
         cv2.setWindowProperty(window, cv2.WND_PROP_TOPMOST, 1)  # keep on top (Windows)
     except Exception:
-        passss
+        pass
     cv2.setMouseCallback(window, drawer.on_mouse)
 
 

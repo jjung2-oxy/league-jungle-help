@@ -1,8 +1,11 @@
+minimap_params:
+  coeff: 0.206
+  margin: 20
 monitor_index: 1
 roi:
-  height: 200
-  left: 2664
-  top: 1404
-  width: 200
+  height: 400
+  left: 2460
+  top: 1200
+  width: 400
 show_scale: 1.0
 target_fps: 20
