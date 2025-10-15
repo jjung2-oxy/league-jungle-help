@@ -97,6 +97,22 @@ class RoiDrawer:
             w, h = abs(x2 - x1), abs(y2 - y1)
             if w >= 10 and h >= 10:
                 self.final_rect = (x_min, y_min, w, h)
+                
+                
+                
+def ensure_window_alive(window_name, mouse_cb):
+    try:
+        visible = cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE)
+    except Exception:
+        visible = -1
+    if visible < 1:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 360, 360)
+        cv2.moveWindow(window_name, 64, 64)
+        try: cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
+        except: pass
+        cv2.setMouseCallback(window_name, mouse_cb)
+        print("[ui] window recreated")
 
 # ----------------- Main -----------------
 def main():
@@ -210,6 +226,8 @@ def main():
             last_overlay_bgr = bgr_disp.copy()
 
             cv2.imshow(window, bgr_disp)
+            ensure_window_alive(window)
+            
 
             # Use waitKeyEx to capture more keys; only works when window has focus
             key = cv2.waitKeyEx(1)
@@ -228,7 +246,9 @@ def main():
 
             # Also check global hotkeys (works even if window focus is elsewhere)
             if hot["quit"]:
+                print("[quit] requested by hotkey (Ctrl+Q or F12).")
                 break
+
 
             if hot["draw"]:
                 drawer.reset()

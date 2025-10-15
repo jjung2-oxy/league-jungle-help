@@ -1,11 +1,7 @@
-#!/usr/bin/env python3
-# Minimap dummy watcher (always-on-top, global hotkeys, learned red hue)
-# Two-stage: (A) ring candidates via HSV learned from template, (B) helmet template match.
 
 import time
 from datetime import datetime
 from pathlib import Path
-from collections import deque
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -28,7 +24,10 @@ DEFAULTS = {
         "ring_pad_frac": 0.35,
         "ring_min_area": 120,      # keep broad; we refine with color
         "ring_max_area": 6000,
-        "ring_min_circ": 0.60
+        "ring_min_circ": 0.60,
+        # Stage B defaults
+        "tmpl_scales": [0.8, 0.9, 1.0, 1.1, 1.2],
+        "tmpl_thresh": 0.62
     },
     "beep_wav": "assets/beep.wav",
     "template_dir": "assets/templates/dummy"
@@ -38,9 +37,8 @@ DEFAULTS = {
 SMOOTH = {
     "frames_confirm": 2,     # frames in a row needed to "be present"
     "frames_release": 3,     # frames in a row needed to "clear"
-    "box_hold_sec": 0.80     # keep drawing box this long after last positive
+    "box_hold_sec": 1.5      # keep drawing box this long after last positive
 }
-
 
 GLOBAL_FB = {
     "enabled": True,
@@ -49,7 +47,6 @@ GLOBAL_FB = {
     "downscale": 0.7,          # search at 70% size then map back
     "accept_thresh": 0.82      # must be strong to accept
 }
-
 
 # ----------------- util: audio -----------------
 def play_beep(beep_path: str):
@@ -79,8 +76,6 @@ def play_beep(beep_path: str):
     except Exception as e:
         print(f"[warn] beep failed: {e}")
 
-
-
 # ----------------- config -----------------
 def load_cfg():
     if CONFIG_PATH.exists():
@@ -103,8 +98,10 @@ def load_cfg():
 def clamp_roi_to_monitor(roi, mon):
     left = max(0, int(roi["left"])); top = max(0, int(roi["top"]))
     width = max(1, int(roi["width"])); height = max(1, int(roi["height"]))
-    if left + width > mon["width"]:  width = mon["width"] - left
-    if top + height > mon["height"]: height = mon["height"] - top
+    if left + width > mon["width"]:
+        width = mon["width"] - left
+    if top + height > mon["height"]:
+        height = mon["height"] - top
     roi.update({"left": left, "top": top, "width": width, "height": height})
     return roi
 
@@ -170,7 +167,6 @@ def learn_red_hsv_from_ring(tmpls: List[Template]) -> Optional[List[Tuple[Tuple[
 
     hue_vals = h[candidates == 1].astype(np.float32)
     # hues wrap at 180; handle bimodal (0..10 and 170..180)
-    # compute two clusters by simple split around 90
     left = hue_vals[hue_vals < 90]
     right = hue_vals[hue_vals >= 90]
     ranges = []
@@ -265,7 +261,6 @@ def brute_best_template_over_roi(bgr_roi, templates, scales=(0.9,1.0,1.1), downs
                         int(round((y+rtmpl.shape[0])*scale_back)))
     return best
 
-
 # ----------------- Stage A: ring candidates -----------------
 def find_ring_candidates(bgr: np.ndarray, pad_frac: float,
                          radius_px: Optional[Tuple[int,int]] = None):
@@ -307,7 +302,6 @@ def find_ring_candidates(bgr: np.ndarray, pad_frac: float,
 
     return mask, boxes
 
-
 # ----------------- Stage B: helmet match -----------------
 def match_helmet_in_patch(patch_bgr: np.ndarray, templates: List[Template],
                           scales: Tuple[float, ...], thresh: float):
@@ -342,7 +336,10 @@ def match_helmet_in_patch(patch_bgr: np.ndarray, templates: List[Template],
 # ----------------- UI helpers -----------------
 class DragBox:
     def __init__(self):
-        self.dragging = False; self.start = None; self.end = None; self.box = None
+        self.dragging = False
+        self.start = None
+        self.end = None
+        self.box = None
     def reset(self):
         self.__init__()
     def on_mouse(self, event, x, y, flags, param):
@@ -368,6 +365,23 @@ def save_template_from_drag(vis_img, box, out_dir: Path):
     print(f"[template] saved {out}")
     return out
 
+def ensure_window_alive(window_name, mouse_cb=None):
+    """Recreate the OpenCV window if it disappears (e.g., from alt-tab or game fullscreen)."""
+    try:
+        visible = cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE)
+    except Exception:
+        visible = -1
+    if visible < 1:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 360, 360)
+        cv2.moveWindow(window_name, 64, 64)
+        try:
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
+        except Exception:
+            pass
+        if mouse_cb:
+            cv2.setMouseCallback(window_name, mouse_cb)
+        print(f"[ui] window {window_name!r} recreated")
 
 # ----------------- main -----------------
 def main():
@@ -389,7 +403,13 @@ def main():
     show = True
     debug_on = True
     show_mask = True
-    hot = {"tmpl": False, "photo": False, "toggle": False, "debug": False, "mask": False, "reload": False, "quit": False}
+    hot = {
+        "tmpl": False, "photo": False, "toggle": False,
+        "debug": False, "mask": False, "reload": False, "quit": False
+    }
+    mods = {"ctrl": False}
+    from pynput.keyboard import Key, KeyCode
+
     def on_press(key):
         try:
             k = key.char.lower() if hasattr(key, "char") and key.char else ""
@@ -401,18 +421,22 @@ def main():
         elif k == "d": hot["debug"] = True
         elif k == "m": hot["mask"] = True
         elif k == "r": hot["reload"] = True
-        elif k == "q": hot["quit"] = True
-        if key == keyboard.Key.esc:
+        # Require Ctrl+Q to quit (avoid accidental ESC from game)
+        if key in (Key.ctrl_l, Key.ctrl_r):
+            mods["ctrl"] = True
+        elif isinstance(key, KeyCode) and key.char and key.char.lower() == "q" and mods["ctrl"]:
             hot["quit"] = True
-    listener = keyboard.Listener(on_press=on_press, suppress=False)
+
+    def on_release(key):
+        if key in (Key.ctrl_l, Key.ctrl_r):
+            mods["ctrl"] = False
+
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release, suppress=False)
     listener.daemon = True
     listener.start()
 
-    dq = deque(maxlen=det["frames_confirm"])
     last_alert_t = 0.0
     target_period = 1.0 / max(1, int(cfg["target_fps"]))
-    fps_s = None
-    last_t = time.time()
 
     window = "Dummy Watcher  (t capture, r reload, d debug, m mask, p photo, v toggle, q/esc quit)"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
@@ -429,7 +453,8 @@ def main():
     with mss.mss() as sct:
         mon = sct.monitors[cfg["monitor_index"]]
         roi = clamp_roi_to_monitor(roi, mon)
-        last_raw = None; last_overlay = None
+        last_raw = None
+        last_overlay = None
 
         frame_idx = 0
         last_global_try_t = 0.0
@@ -441,15 +466,15 @@ def main():
         present_latched = False
         box_latched_until = 0.0
 
+        # cache the last confirmed box so we can draw during hold
+        last_box = None            # (x1, y1, x2, y2)
+        last_box_stage = None      # "A+B" or "GLOBAL"
+        last_box_score = 0.0
 
         while True:
             t0 = time.time()
             boxes, scores = [], []
             present = False
-            best_score = 0.0
-            cand_count = 0
-            # (DO NOT reset frame_idx / last_global_try_t / suspend_global_until / last_event here)
-
 
             try:
                 bgr = grab_roi_frame(sct, mon, roi)
@@ -460,7 +485,6 @@ def main():
                     pad_frac=det.get("ring_pad_frac", 0.35),
                     radius_px=None  # or (12, 26) if you want to force it
                 )
-                cand_count = len(cands)
 
                 vis = bgr.copy()
                 if debug_on:
@@ -469,7 +493,6 @@ def main():
 
                 # ---- Stage B: best helmet match across Stage-A candidates ----
                 best = None                 # (score, (x1,y1,x2,y2))
-                best_score = 0.0
                 have_helmet = any(t.kind == "helmet" for t in templates)
 
                 # use det config if you have it; otherwise fallback defaults
@@ -480,7 +503,7 @@ def main():
                     patch = bgr[y:y+h, x:x+w]
                     m = match_helmet_in_patch(
                         patch,
-                        templates if have_helmet else templates,   # (kept shape; prefers helmet inside the fn)
+                        templates if have_helmet else templates,   # (kept for future branching)
                         scales=tmpl_scales,
                         thresh=tmpl_thresh,
                     )
@@ -488,9 +511,8 @@ def main():
                         continue
                     sc, px1, py1, px2, py2 = m
                     gx1, gy1, gx2, gy2 = x + px1, y + py1, x + px2, y + py2
-                    if (best is None) or (sc > best_score):
+                    if (best is None) or (sc > best[0]):
                         best = (sc, (gx1, gy1, gx2, gy2))
-                        best_score = sc
 
                 boxes, scores = [], []
                 present = False
@@ -504,6 +526,10 @@ def main():
                     cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.putText(vis, f"{sc:.2f}", (x1, max(0, y1 - 4)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    # cache last box
+                    last_box = (x1, y1, x2, y2)
+                    last_box_stage = "A+B"
+                    last_box_score = sc
 
                 # ---- GLOBAL fallback (rate-limited & downscaled) ----
                 now = time.time()
@@ -532,20 +558,27 @@ def main():
                         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 255), 2)  # yellow = fallback
                         cv2.putText(vis, f"{sc:.2f} (global)", (x1, max(0, y1 - 4)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-
+                        # cache last box
+                        last_box = (x1, y1, x2, y2)
+                        last_box_stage = "GLOBAL"
+                        last_box_score = sc
 
                 # ---- Presence smoothing / hysteresis ----
                 now = time.time()
                 present_raw = len(boxes) > 0
-                
+
                 if present_raw and last_event.get("stage") == "GLOBAL":
-                    present_run = max(present_run, SMOOTH["frames_confirm"])
+                    # treat strong global as instant confirm
+                    present_run = max(1, SMOOTH["frames_confirm"])
+                else:
+                    # normal update
+                    pass
 
                 if present_raw:
-                    present_run += 1
+                    present_run = min(present_run + 1, 10**6)
                     absent_run = 0
                 else:
-                    absent_run += 1
+                    absent_run = min(absent_run + 1, 10**6)
                     # don't increment present_run on negatives
                     present_run = 0
 
@@ -571,13 +604,17 @@ def main():
 
                 # ---- Draw the last box while latched/held ----
                 draw_box = present_raw or (now < box_latched_until)
-                if draw_box and boxes:
-                    (x1, y1, x2, y2) = boxes[0]
-                    color = (0, 255, 0) if last_event.get("stage") == "A+B" else (0, 255, 255)
-                    cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(vis, f"{last_event.get('score',0):.2f}",
-                                (x1, max(0, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
+                if draw_box:
+                    if present_raw and boxes:
+                        # current frame already drew its box above for A+B or GLOBAL
+                        pass
+                    elif last_box is not None:
+                        x1, y1, x2, y2 = last_box
+                        color = (0, 255, 0) if (last_box_stage == "A+B") else (0, 255, 255)
+                        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(vis, f"{last_box_score:.2f}",
+                                    (x1, max(0, y1 - 4)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
                 # Mask inset (top-right) to visualize what Stage-A sees
                 if show_mask:
@@ -589,36 +626,52 @@ def main():
                     cv2.rectangle(vis, (x0, y0), (x0+120, y0+120), (0,255,255), 1)
                     cv2.putText(vis, "mask", (x0+4, y0+14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1)
 
-                last_raw = bgr; last_overlay = vis
+                last_raw = bgr
+                last_overlay = vis
                 if show:
                     cv2.imshow(window, vis)
+                    ensure_window_alive(window)
 
                 # Local keys
                 key = cv2.waitKey(1) & 0xFF
-                if key in (ord('q'), 27): hot["quit"] = True
-                elif key == ord('v'): hot["toggle"] = True
-                elif key == ord('p'): hot["photo"] = True
-                elif key == ord('t'): hot["tmpl"] = True
-                elif key == ord('d'): hot["debug"] = True
-                elif key == ord('m'): hot["mask"]  = True
-                elif key == ord('r'): hot["reload"] = True
+                if key in (ord('q'), 27):
+                    hot["quit"] = True
+                elif key == ord('v'):
+                    hot["toggle"] = True
+                elif key == ord('p'):
+                    hot["photo"] = True
+                elif key == ord('t'):
+                    hot["tmpl"] = True
+                elif key == ord('d'):
+                    hot["debug"] = True
+                elif key == ord('m'):
+                    hot["mask"]  = True
+                elif key == ord('r'):
+                    hot["reload"] = True
 
                 # Global hotkeys
-                if hot["quit"]: break
-                if hot["toggle"]: show = not show; hot["toggle"] = False
-                if hot["debug"]: debug_on = not debug_on; hot["debug"] = False
-                if hot["mask"]:  show_mask = not show_mask; hot["mask"] = False
+                if hot["quit"]:
+                    break
+                if hot["toggle"]:
+                    show = not show; hot["toggle"] = False
+                if hot["debug"]:
+                    debug_on = not debug_on; hot["debug"] = False
+                if hot["mask"]:
+                    show_mask = not show_mask; hot["mask"] = False
                 if hot["photo"]:
                     Path("screenshots").mkdir(parents=True, exist_ok=True)
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                    cv2.imwrite(f"screenshots/roi_{ts}.png", last_raw)
-                    cv2.imwrite(f"screenshots/roi_overlay_{ts}.png", last_overlay)
+                    if last_raw is not None:
+                        cv2.imwrite(f"screenshots/roi_{ts}.png", last_raw)
+                    if last_overlay is not None:
+                        cv2.imwrite(f"screenshots/roi_overlay_{ts}.png", last_overlay)
                     print(f"[snap] screenshots/roi_{ts}.png")
                     hot["photo"] = False
                 if hot["reload"]:
                     templates = load_templates(Path(cfg["template_dir"]))
                     learned = learn_red_hsv_from_ring(templates)
-                    if learned is not None: learned_ranges = learned
+                    if learned is not None:
+                        learned_ranges = learned
                     print("[info] reloaded templates.")
                     hot["reload"] = False
 
@@ -634,13 +687,14 @@ def main():
             elapsed = time.time() - t0
             if elapsed < target_period:
                 time.sleep(target_period - elapsed)
-            
+
             frame_idx += 1
 
-
     cv2.destroyAllWindows()
-    try: listener.stop()
-    except Exception as e: print(f"[error] listener failed: {e}")
+    try:
+        listener.stop()
+    except Exception as e:
+        print(f"[error] listener failed: {e}")
 
 if __name__ == "__main__":
     main()
