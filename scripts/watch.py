@@ -588,7 +588,7 @@ def main():
                     # Beep on rising edge (and apply cooldown you already track)
                     if (now - last_alert_t) >= det["cooldown_sec"]:
                         print(f"[alert] Dummy via {last_event['stage']} | score={last_event['score']:.2f}")
-                        play_beep(cfg["beep_wav"])
+                        # play_beep(cfg["beep_wav"])
                         last_alert_t = now
                         suspend_global_until = now + det["cooldown_sec"]  # keep GLOBAL off during cooldown
                     # keep drawing the box for a short time even if the next frame drops

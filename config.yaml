@@ -9,3 +9,4 @@ roi:
   width: 400
 show_scale: 1.0
 target_fps: 20
+audio_mode: winsound
